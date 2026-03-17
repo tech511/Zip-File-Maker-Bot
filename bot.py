@@ -19,7 +19,7 @@ DOWNLOAD_DIR = "downloads"
 OUTPUT_DIR = "output"
 
 MAX_SPLIT = 2000000000
-AUTO_DELETE_TIME = 300
+AUTO_DELETE_TIME = 300  # Auto-delete still applies for non-batch files
 
 MAX_PARALLEL_DOWNLOADS = 1
 THREAD_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=4)
@@ -65,7 +65,6 @@ async def progress(current, total, message, start):
     msg_id = message.id
     now = time.time()
 
-    # Update every 5 seconds
     if msg_id in last_update_time and now - last_update_time[msg_id] < 5:
         return
     last_update_time[msg_id] = now
@@ -74,11 +73,9 @@ async def progress(current, total, message, start):
     speed = current / diff if diff else 0
     percent = (current / total) * 100 if total else 0
 
-    # ETA calculation
     eta = (total - current) / speed if speed > 0 else 0
     eta_min, eta_sec = divmod(int(eta), 60)
 
-    # Pretty small progress bar
     bar_len = 20
     filled = int(bar_len * percent / 100)
     bar = "█" * filled + "░" * (bar_len - filled)
@@ -135,12 +132,10 @@ I Can Convert Any Video Or Files Into Zip Files._
 
 Maintain By:- @{OWNER_USERNAME}
 """
-
     buttons = InlineKeyboardMarkup([
         [InlineKeyboardButton("Owner", url=f"https://t.me/{OWNER_USERNAME}")],
         [InlineKeyboardButton("Update Channel", url=CHANNEL_LINK)]
     ])
-
     if start_image:
         await message.reply_photo(start_image, caption=text, reply_markup=buttons)
     else:
@@ -167,12 +162,20 @@ async def done_batch(client, message):
 
     with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_STORED) as z:
         for f in files:
-            z.write(f)
+            if os.path.exists(f):
+                z.write(f)
+            else:
+                await message.reply_text(f"⚠️ File missing: {os.path.basename(f)}")
 
     parts = split_file(zip_path)
     for part in parts:
         await client.send_document(message.chat.id, part)
         asyncio.create_task(auto_delete(part))
+
+    # Delete batch files safely AFTER sending
+    for f in files:
+        if os.path.exists(f):
+            os.remove(f)
 
     batch_mode.pop(user, None)
 
@@ -225,12 +228,16 @@ async def handle_file(client, message):
             msg = await message.reply_text("Downloading...")
             start_time = time.time()
 
-            # PYROGRAM DOWNLOAD (Telegram only)
+            # PYROGRAM DOWNLOAD
             file_path = await message.download(file_name=f"{DOWNLOAD_DIR}/")
-            asyncio.create_task(auto_delete(file_path))
 
             # AUTO BATCH
             batch_mode.setdefault(message.from_user.id, []).append(file_path)
+
+            # Only auto-delete non-batch files
+            if message.from_user.id not in batch_mode:
+                asyncio.create_task(auto_delete(file_path))
+
             await msg.edit_text("Added to batch automatically ✅")
 
     await task_queue.put(task)
