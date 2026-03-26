@@ -1,250 +1,282 @@
-import os, re, asyncio, time, math, subprocess
-
-from pyrogram import Client
-from telegram import *
-from telegram.ext import *
+import os
+import re
+import time
+import zipfile
+import asyncio
+from pyrogram import Client, filters
+from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 # ============ CONFIG ============
-BOT_TOKEN = "YOUR_BOT_TOKEN"
 API_ID = 123456
 API_HASH = "YOUR_API_HASH"
+BOT_TOKEN = "YOUR_BOT_TOKEN"
+OWNER_ID = 8207582785
 
-OWNER_ID = 123456789
-FORCE_CHANNEL = "your_channel"
-OWNER_USERNAME = "your_username"
-UPDATE_CHANNEL = "https://t.me/your_channel"
-LOG_CHANNEL = -100xxxxxxxx
+DOWNLOAD_DIR = "downloads"
+ZIP_DIR = "zips"
 
-MAX_USERS = 4
-TIMEOUT = 600
-SPLIT_SIZE = 2 * 1024 * 1024 * 1024
+os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+os.makedirs(ZIP_DIR, exist_ok=True)
 
-# ============ DB ============
+app = Client("final_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+
+# ============ DATA ============
 admins = set()
-banned = set()
-sessions = {}
-prefix_db = {}
-pending = {}
+approved_users = set()
+banned_users = set()
+users_batch = {}
+prefix_data = {}
+active_tasks = set()
+start_image = None
 
-queue = asyncio.Queue()
-active = set()
-cancel_flag = {}
+# ============ HELPERS ============
+def is_owner(uid): return uid == OWNER_ID
+def is_admin(uid): return uid in admins or is_owner(uid)
+def is_approved(uid): return uid in approved_users or is_admin(uid)
 
-START_IMAGE = None
+def extract_episode(text):
+    patterns = [
+        r"S(\d+)[\s._-]?E(\d+)",
+        r"Season\s*(\d+)\s*Episode\s*(\d+)",
+        r"E(\d+)"
+    ]
+    for p in patterns:
+        m = re.search(p, text, re.IGNORECASE)
+        if m:
+            if len(m.groups()) == 2:
+                return f"S{int(m.group(1)):02d}E{int(m.group(2)):02d}"
+            else:
+                return f"E{int(m.group(1)):02d}"
+    return None
 
-pyro = Client("bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+def progress_bar(done, total, speed, status):
+    percent = int((done/total)*100)
+    bar = "█"*(percent//10) + "░"*(10-percent//10)
+    return f"""
+{status}
 
-# ============ AUTH ============
-def is_owner(x): return x == OWNER_ID
-def is_admin(x): return x in admins
-def is_auth(x): return is_owner(x) or is_admin(x)
-
-async def deny(update):
-    await update.message.reply_text("<b><i>You Are Not Authorized 🙄</i></b>", parse_mode="HTML")
+[{bar}] {percent}%
+⚡ Speed: {speed:.2f} MB/s
+📦 {done}/{total}
+"""
 
 # ============ START ============
-async def start(update, context):
-    user = update.effective_user
+@app.on_message(filters.command("start"))
+async def start(client, message):
 
-    txt = f"<b><i>Hello {user.first_name}\n\nI Am A Simple File Convertor Bot. I Can Converter All Files Or Videos In Zip Files.\n\nMaintained By :- @AniWorld_Bot_Hub</i></b>"
+    text = f"""**╔═══『 🤖 ZIP MAKER BOT 』═══╗**
 
-    btn = InlineKeyboardMarkup([
-        [InlineKeyboardButton("Owner", url=f"https://t.me/{OWNER_USERNAME}")],
-        [InlineKeyboardButton("Update Channel", url=UPDATE_CHANNEL)]
+**👋 Hello, {message.from_user.first_name}**
+
+__I Am An Advanced File To Zip Maker Bot.__  
+__I Can Convert Your Videos & Files Into Zip Easily.__
+
+***⚡ Fast • Smart • Reliable ⚡***
+
+> **Maintain By:** @AniWorld_Bot_Hub
+
+**╚═══════════════════════╝**"""
+
+    buttons = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("👑 Owner", url="https://t.me/AniWorld_Bot_Hub"),
+            InlineKeyboardButton("📜 Commands", callback_data="cmd")
+        ],
+        [
+            InlineKeyboardButton("📢 Update Channel", url="https://t.me/AniWorld_Bot_Hub")
+        ]
     ])
 
-    if START_IMAGE:
-        await update.message.reply_photo(START_IMAGE, caption=txt, reply_markup=btn, parse_mode="HTML")
+    if start_image:
+        await message.reply_photo(start_image, caption=text, reply_markup=buttons)
     else:
-        await update.message.reply_text(txt, reply_markup=btn, parse_mode="HTML")
+        await message.reply_text(text, reply_markup=buttons)
 
-# ============ ADD IMAGE ============
-async def add_image(update, context):
-    if not is_owner(update.effective_user.id):
-        return await deny(update)
+# ============ COMMAND UI ============
+@app.on_callback_query(filters.regex("cmd"))
+async def cmd(client, query):
+    text = """**📜 Commands**
 
-    pending["img"] = True
-    await update.message.reply_text("<b><i>Send Me The Image😊</i></b>", parse_mode="HTML")
+/start To Check Bot Alive Or Not😵‍💫
+/batch To Convert Multiple Files😗
+/lzip To Convert Files Into Zip📦
+/prefix To Set Prefix🏷️
+/add_admin To Add Admin {Only Owner Can Use}👑
+/add_image To Add Image {Only Owner Can Use}🖼️
+/panel To See Bot Dashboard {Only Owner Can Use}📊"""
 
-async def save_img(update, context):
-    global START_IMAGE
-    if pending.get("img"):
-        f = await update.message.photo[-1].get_file()
-        await f.download_to_drive("start.jpg")
-        START_IMAGE = "start.jpg"
-        pending["img"] = False
-
-# ============ ADD ADMIN ============
-async def add_admin(update, context):
-    if not is_owner(update.effective_user.id):
-        return await deny(update)
-
-    pending["admin"] = True
-    await update.message.reply_text("<b><i>Send Your ID🥴</i></b>", parse_mode="HTML")
-
-async def set_admin(update, context):
-    if pending.get("admin"):
-        admins.add(int(update.message.text))
-        pending["admin"] = False
-        await update.message.reply_text("<b><i>Admin Added🙂</i></b>", parse_mode="HTML")
-
-# ============ PREFIX ============
-async def prefix(update, context):
-    if not is_auth(update.effective_user.id):
-        return await deny(update)
-
-    pending["prefix"] = update.effective_user.id
-    await update.message.reply_text("<b><i>Send Your Prefix 🤧</i></b>", parse_mode="HTML")
-
-async def set_prefix(update, context):
-    uid = update.effective_user.id
-    if pending.get("prefix") == uid:
-        prefix_db[uid] = update.message.text
-        pending["prefix"] = None
-        await update.message.reply_text("<b><i>Your Prefix Added🙃</i></b>", parse_mode="HTML")
-
-# ============ BATCH ============
-async def batch(update, context):
-    uid = update.effective_user.id
-    if not is_auth(uid): return await deny(update)
-
-    sessions[uid] = {"files": [], "time": time.time()}
-    await update.message.reply_text("<b><i>Send Your Videos One By One😮‍💨</i></b>", parse_mode="HTML")
-
-# ============ FILE ============
-async def file_handler(update, context):
-    uid = update.effective_user.id
-    if uid not in sessions: return
-
-    msg = await update.message.reply_text("Downloading...")
-
-    file = await pyro.download_media(update.message.document.file_id)
-    sessions[uid]["files"].append(file)
-
-    count = len(sessions[uid]["files"])
-    size = sum(os.path.getsize(f) for f in sessions[uid]["files"])
-
-    await msg.edit_text(
-        f"<b><i>{count} Files Added ✅\nTotal Size: {size//(1024*1024)} MB\n\n/lzip -n [File name] [All EP] [File Quality]</i></b>",
-        parse_mode="HTML"
+    await query.message.edit_text(text,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("⬅️ Back", callback_data="back")]
+        ])
     )
 
-# ============ WATERMARK ============
-def watermark(inp, out):
-    subprocess.run([
-        "ffmpeg", "-i", inp,
-        "-vf", "drawtext=text='Powered By @AniWorld_Zone':x=10:y=H-th-10:fontsize=24:fontcolor=white",
-        "-c:a", "copy", out
-    ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+@app.on_callback_query(filters.regex("back"))
+async def back(client, query):
+    await start(client, query.message)
 
-# ============ SPLIT ============
-def split_file(file):
-    if os.path.getsize(file) < SPLIT_SIZE:
-        return [file]
+# ============ ADD ADMIN ============
+@app.on_message(filters.command("add_admin"))
+async def add_admin(client, message):
+    if not is_owner(message.from_user.id):
+        return await message.reply_text("**You're Not Authorized 😤**")
 
-    parts = []
-    with open(file, "rb") as f:
-        i = 0
-        while True:
-            chunk = f.read(SPLIT_SIZE)
-            if not chunk: break
-            part = f"{file}.part{i}"
-            with open(part, "wb") as p:
-                p.write(chunk)
-            parts.append(part)
-            i += 1
-    return parts
+    try:
+        uid = int(message.text.split()[1])
+        admins.add(uid)
+        await message.reply_text(f"✅ Admin Added: {uid}")
+    except:
+        await message.reply_text("Usage: /add_admin user_id")
+
+# ============ ADD IMAGE ============
+@app.on_message(filters.command("add_image"))
+async def add_image(client, message):
+    if not is_owner(message.from_user.id):
+        return await message.reply_text("**You're Not Authorized 😤**")
+
+    await message.reply_text("Send Image 🖼️")
+
+# SINGLE PHOTO HANDLER (NO DUPLICATE)
+@app.on_message(filters.photo)
+async def save_image(client, message):
+    global start_image
+
+    if message.from_user.id != OWNER_ID:
+        return
+
+    start_image = message.photo.file_id
+    await message.reply_text("✅ Image Saved")
+
+# ============ PREFIX ============
+@app.on_message(filters.command("prefix"))
+async def prefix(client, message):
+    prefix_data[message.from_user.id] = message.text.replace("/prefix", "").strip()
+    await message.reply_text("Prefix Saved 🏷️")
+
+# ============ PANEL ============
+@app.on_message(filters.command("panel"))
+async def panel(client, message):
+    if not is_owner(message.from_user.id):
+        return
+
+    buttons = InlineKeyboardMarkup([
+        [InlineKeyboardButton("Approve User", callback_data="approve")],
+        [InlineKeyboardButton("Ban User", callback_data="ban")],
+        [InlineKeyboardButton("Clean Disk", callback_data="clean")]
+    ])
+
+    await message.reply_text("Admin Panel ⚙️", reply_markup=buttons)
+
+@app.on_callback_query(filters.regex("clean"))
+async def clean_disk(client, query):
+    for f in os.listdir(DOWNLOAD_DIR):
+        os.remove(os.path.join(DOWNLOAD_DIR, f))
+    for f in os.listdir(ZIP_DIR):
+        os.remove(os.path.join(ZIP_DIR, f))
+    await query.answer("Disk Cleaned 🧹", show_alert=True)
+
+# ============ BATCH ============
+@app.on_message(filters.command("batch"))
+async def batch(client, message):
+    uid = message.from_user.id
+
+    if uid in banned_users:
+        return await message.reply_text("Banned ❌")
+
+    if not is_approved(uid):
+        return await message.reply_text("Not Approved ❌")
+
+    if len(active_tasks) >= 4:
+        return await message.reply_text("Bot Busy 😵‍💫")
+
+    users_batch[uid] = []
+    await message.reply_text("Send Files 📂")
+
+# ============ COLLECT ============
+@app.on_message(filters.video | filters.document | filters.audio)
+async def collect(client, message):
+    uid = message.from_user.id
+    if uid not in users_batch:
+        return
+
+    users_batch[uid].append(message)
+    await message.reply_text(f"File Added ✅ Total: {len(users_batch[uid])}")
 
 # ============ LZIP ============
-async def lzip(update, context):
-    uid = update.effective_user.id
-    if not is_auth(uid): return await deny(update)
+@app.on_message(filters.command("lzip"))
+async def lzip(client, message):
+    uid = message.from_user.id
 
-    if uid not in sessions: return
+    if not is_approved(uid):
+        return await message.reply_text("Not Approved ❌")
 
-    if time.time() - sessions[uid]["time"] > TIMEOUT:
-        return await update.message.reply_text("<b><i>Time Limit Reached 😆</i></b>", parse_mode="HTML")
+    files = users_batch.get(uid)
+    if not files:
+        return await message.reply_text("No Files ❌")
 
-    meta = re.findall(r"\[(.*?)\]", update.message.text)
-    if len(meta) < 3: return
+    match = re.findall(r"\[(.*?)\]", message.text)
+    name = match[0] if len(match)>0 else "Series"
+    quality = match[-1] if len(match)>1 else ""
 
-    await update.message.reply_text("<b><i>Strating...🚀</i></b>", parse_mode="HTML")
-    await queue.put((uid, meta, sessions[uid]["files"]))
+    prefix = prefix_data.get(uid, "")
 
-# ============ WORKER ============
-async def worker(app):
-    while True:
-        uid, meta, files = await queue.get()
-        active.add(uid)
-        cancel_flag[uid] = False
+    msg = await message.reply_text("Starting... ⏳")
+    start_time = time.time()
 
-        msg = await app.bot.send_message(uid, "Processing...")
+    zip_path = f"{ZIP_DIR}/{uid}.zip"
+    z = zipfile.ZipFile(zip_path, "w")
 
-        try:
-            prefix = prefix_db.get(uid, "")
-            name, ep, quality = meta[0], meta[1], meta[2]
+    for i, m in enumerate(files):
+        speed = (i+1)/(time.time()-start_time+1)
 
-            for i, f in enumerate(files):
-                if cancel_flag[uid]: break
+        await msg.edit_text(progress_bar(i+1, len(files), speed, "📥 Downloading"))
 
-                wm = f"{f}_wm.mp4"
-                watermark(f, wm)
+        file_path = await m.download(file_name=f"{DOWNLOAD_DIR}/{uid}_{i}")
 
-                zipname = f"{uid}_{i}.zip"
-                subprocess.run(["zip", zipname, wm])
+        ep = extract_episode(m.caption or "") or f"E{i+1:02d}"
+        new_name = f"{prefix} {name} {ep} {quality}.mkv"
+        new_path = f"{DOWNLOAD_DIR}/{new_name}"
 
-                parts = split_file(zipname)
+        os.rename(file_path, new_path)
 
-                for part in parts:
-                    await app.bot.send_document(
-                        uid,
-                        open(part, "rb"),
-                        caption=f"{prefix} [{name}] [EP {i+1}] [{quality}]"
-                    )
-                    os.remove(part)
+        await msg.edit_text(progress_bar(i+1, len(files), speed, "📦 Zipping"))
+        z.write(new_path, new_name)
 
-                os.remove(wm)
-                os.remove(zipname)
+    z.close()
 
-                await msg.edit_text(f"Processed {i+1}/{len(files)}")
+    # SPLIT 2GB
+    parts = []
+    size = os.path.getsize(zip_path)
 
-        finally:
-            active.remove(uid)
-            sessions.pop(uid, None)
-            await msg.delete()
-            queue.task_done()
-
-# ============ CANCEL ============
-async def cancel(update, context):
-    uid = update.effective_user.id
-    if uid in active:
-        cancel_flag[uid] = True
-        await update.message.reply_text("<b><i>All Progress Are Stopped 😑</i></b>", parse_mode="HTML")
+    if size > 2*1024*1024*1024:
+        part_size = 2*1024*1024*1024
+        with open(zip_path, "rb") as f:
+            i = 1
+            while True:
+                chunk = f.read(part_size)
+                if not chunk:
+                    break
+                part = f"{zip_path}.{i:03d}"
+                with open(part, "wb") as p:
+                    p.write(chunk)
+                parts.append(part)
+                i += 1
     else:
-        await update.message.reply_text("<b><i>No Task Was Running 😁</i></b>", parse_mode="HTML")
+        parts.append(zip_path)
 
-# ============ MAIN ============
-async def main():
-    await pyro.start()
+    for p in parts:
+        await msg.edit_text("📤 Uploading...")
+        await message.reply_document(p)
 
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    # CLEAN
+    for f in os.listdir(DOWNLOAD_DIR):
+        os.remove(os.path.join(DOWNLOAD_DIR, f))
+    for p in parts:
+        os.remove(p)
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("add_image", add_image))
-    app.add_handler(CommandHandler("add_admin", add_admin))
-    app.add_handler(CommandHandler("batch", batch))
-    app.add_handler(CommandHandler("lzip", lzip))
-    app.add_handler(CommandHandler("prefix", prefix))
-    app.add_handler(CommandHandler("cancel", cancel))
+    users_batch[uid] = []
+    active_tasks.discard(uid)
 
-    app.add_handler(MessageHandler(filters.PHOTO, save_img))
-    app.add_handler(MessageHandler(filters.TEXT, set_admin))
-    app.add_handler(MessageHandler(filters.TEXT, set_prefix))
-    app.add_handler(MessageHandler(filters.Document.ALL, file_handler))
-
-    asyncio.create_task(worker(app))
-
-    print("Bot Running...")
-    await app.run_polling()
-
-asyncio.run(main())
+# ============ RUN ============
+print("Bot Running...")
+app.run()
